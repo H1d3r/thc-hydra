@@ -1,5 +1,5 @@
 #include "hydra-mod.h"
-#include <arpa/telnet.h>
+#include <ctype.h>
 
 extern char *HYDRA_EXIT;
 char *buf;
@@ -83,8 +83,11 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
       return 1;
     }
 
-    /* Enhanced password prompt detection (multilingual + variants) */
-    if (hydra_strcasestr(buf, "asswor") != NULL || hydra_strcasestr(buf, "asscode") != NULL ||
+    /* Enhanced password prompt detection (multilingual + variants) 
+     * Re-added: "ennwort" (German Kennwort) and "asscode" per vanhauser-thc request */
+    if (hydra_strcasestr(buf, "asswor") != NULL || 
+        hydra_strcasestr(buf, "asscode") != NULL ||
+        hydra_strcasestr(buf, "ennwort") != NULL ||
         strstr(buf, "passwd:") != NULL || strstr(buf, "pass:") != NULL ||
         strstr(buf, "pwd:") != NULL || strstr(buf, "pin:") != NULL ||
         strstr(buf, "пароль:") != NULL || strstr(buf, "contraseña:") != NULL ||
@@ -109,7 +112,7 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
       break;
     }
     if (username_prompt_seen) {
-      break;  /* We need to send login */
+      break;
     }
   }
 
@@ -127,9 +130,44 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
         usleepn(20);
       }
     } else {
-      if (hydra_send(s, buffer, strlen(buffer), 0) < 0)  /* Note: removed +1 to match common practice */
+      if (hydra_send(s, buffer, strlen(buffer) + 1, 0) < 0)
         return 1;
     }
+
+    /* Wait for password prompt after sending username */
+    int32_t i = 0;
+    do {
+      if ((buf = hydra_receive_line(s)) == NULL)
+        return 1;
+
+      if (strchr(buf, '/') != NULL || strchr(buf, '>') != NULL || strchr(buf, '%') != NULL ||
+          strchr(buf, '$') != NULL || strchr(buf, '#') != NULL) {
+        hydra_report_found_host(port, ip, "telnet", fp);
+        hydra_completed_pair_found();
+        free(buf);
+        if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+          return 3;
+        return 1;
+      }
+
+      (void)make_to_lower(buf);
+      
+      /* Check for password prompt - includes ennwort and asscode */
+      if (hydra_strcasestr(buf, "asswor") != NULL || 
+          hydra_strcasestr(buf, "asscode") != NULL || 
+          hydra_strcasestr(buf, "ennwort") != NULL)
+        i = 1;
+
+      if (i == 0 && ((strstr(buf, "ogin:") != NULL && strstr(buf, "last login") == NULL) ||
+                     strstr(buf, "sername:") != NULL)) {
+        free(buf);
+        hydra_completed_pair();
+        if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+          return 3;
+        return 2;
+      }
+      free(buf);
+    } while (i == 0);
   }
 
   /* Send password */
@@ -145,7 +183,7 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
       usleepn(20);
     }
   } else {
-    if (hydra_send(s, buffer, strlen(buffer), 0) < 0)
+    if (hydra_send(s, buffer, strlen(buffer) + 1, 0) < 0)
       return 1;
   }
 
@@ -155,10 +193,10 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
 
     /* Success detection */
     if ((miscptr != NULL && strstr(buf, miscptr) != NULL) ||
-        (miscptr == NULL && 
+        (miscptr == NULL && !is_failure(buf) &&
          (strchr(buf, '/') != NULL || strchr(buf, '>') != NULL ||
           strchr(buf, '$') != NULL || strchr(buf, '#') != NULL ||
-          strchr(buf, '%') != NULL || 
+          strchr(buf, '%') != NULL ||
           (buf[1] == '\xfd' && buf[2] == '\x18')))) {
       hydra_report_found_host(port, ip, "telnet", fp);
       hydra_completed_pair_found();
@@ -177,8 +215,11 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
       return 2;
     }
 
-    /* Re-prompt for password -> try next password */
-    if (hydra_strcasestr(buf, "asswor") != NULL || strstr(buf, "passwd:") != NULL ||
+    /* Re-prompt for password -> try next password (includes ennwort/asscode) */
+    if (hydra_strcasestr(buf, "asswor") != NULL || 
+        hydra_strcasestr(buf, "asscode") != NULL ||
+        hydra_strcasestr(buf, "ennwort") != NULL ||
+        strstr(buf, "passwd:") != NULL ||
         strstr(buf, "pass:") != NULL || strstr(buf, "pwd:") != NULL) {
       hydra_completed_pair();
       free(buf);
@@ -196,7 +237,7 @@ int32_t start_telnet(int32_t s, char *ip, int32_t port, unsigned char options, c
           usleepn(20);
         }
       } else {
-        hydra_send(s, buffer, strlen(buffer), 0);
+        hydra_send(s, buffer, strlen(buffer) + 1, 0);
       }
       continue;
     }
@@ -235,7 +276,6 @@ void service_telnet(char *ip, int32_t sp, unsigned char options, char *miscptr, 
     case 1: /* connect and init */
       if (sock >= 0)
         sock = hydra_disconnect(sock);
-
       no_line_mode = 0;
       first = 0;
 
@@ -248,6 +288,7 @@ void service_telnet(char *ip, int32_t sp, unsigned char options, char *miscptr, 
         sock = hydra_connect_ssl(ip, mysslport, hostname);
         port = mysslport;
       }
+
       if (sock < 0) {
         hydra_report(stderr, "[ERROR] Child with pid %d terminating, can not connect\n", (int32_t)getpid());
         hydra_child_exit(1);
@@ -267,21 +308,27 @@ void service_telnet(char *ip, int32_t sp, unsigned char options, char *miscptr, 
         }
       }
 
-      if (hydra_strcasestr(buf, "login") != NULL || hydra_strcasestr(buf, "sername:") != NULL)
+      if (hydra_strcasestr(buf, "login") != NULL || hydra_strcasestr(buf, "sername:") != NULL) {
         waittime = 6;
+        if (debug)
+          hydra_report(stdout, "DEBUG: waittime set to %d\n", waittime);
+      }
 
       /* Telnet option negotiation */
       do {
         unsigned char *buf2 = (unsigned char *)buf;
-
         while (*buf2 == IAC) {
           if (first == 0) {
+            if (debug)
+              hydra_report(stdout, "DEBUG: requested line mode\n");
             fck = write(sock, "\xff\xfb\x22", 3); /* WILL LINEMODE */
             first = 1;
           }
-          if ((buf[1] == '\xfc' || buf[1] == '\xfe') && buf2[2] == '\x22')
+          if ((buf[1] == '\xfc' || buf[1] == '\xfe') && buf2[2] == '\x22') {
             no_line_mode = 1;
-
+            if (debug)
+              hydra_report(stdout, "DEBUG: TELNETD peer does not like linemode!\n");
+          }
           if (buf2[2] != '\x22') {
             if (buf2[1] == WILL || buf2[1] == WONT)
               buf2[1] = DONT;
@@ -291,7 +338,6 @@ void service_telnet(char *ip, int32_t sp, unsigned char options, char *miscptr, 
           }
           buf2 += 3;
         }
-
         if (buf2 != (unsigned char *)buf) {
           free(buf);
           buf = hydra_receive_line(sock);
@@ -300,14 +346,11 @@ void service_telnet(char *ip, int32_t sp, unsigned char options, char *miscptr, 
         }
         if (buf != NULL && buf[0] != 0 && (unsigned char)buf[0] != IAC)
           make_to_lower(buf);
-      } while (buf != NULL && (unsigned char)buf[0] == IAC);
+      } while (buf != NULL && (unsigned char)buf[0] == IAC &&
+               hydra_strcasestr(buf, "ogin:") == NULL &&
+               hydra_strcasestr(buf, "sername:") == NULL);
 
-      /* Drain remaining banner lines (helps password-only detection) */
-      while ((buf = hydra_receive_line(sock)) != NULL && strlen(buf) > 0 && (unsigned char)buf[0] != IAC) {
-        free(buf);
-      }
-      if (buf) free(buf);
-
+      free(buf);
       waittime = old_waittime;
       next_run = 2;
       break;
@@ -339,7 +382,7 @@ void usage_telnet(const char *service) {
          "a successful login (case insensitive), useful if default detection has false positives.\n\n"
          "This improved version features:\n"
          " - Automatic password-only mode detection and handling (e.g., Cisco, embedded devices)\n"
-         " - Multilingual prompt support (English, Russian, Spanish, etc.)\n"
+         " - Multilingual prompt support (English, German, Russian, Spanish, etc.)\n"
          " - Extensive failure message detection to avoid false positives\n"
          "For password-only servers, use: hydra -l \"\" -P passwords.txt ip telnet\n");
 }
